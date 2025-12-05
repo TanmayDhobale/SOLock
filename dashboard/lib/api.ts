@@ -83,3 +83,25 @@ export async function fetchDashboardStats(
     return response.json();
 }
 
+export interface LiveFeeEstimate {
+    account: string;
+    queue_depth: number;
+    p90_fee_lamports: number;
+    recommended_fee_lamports: number;
+    recommended_fee_sol: number;
+    avg_contention: number;
+    slots_observed: number;
+    freshness_seconds: number;
+}
+
+export async function fetchLiveFee(pubkey: string): Promise<LiveFeeEstimate> {
+    const response = await fetch(
+        `${API_BASE_URL}/api/accounts/${pubkey}/fee-now`
+    );
+    if (!response.ok) {
+        throw new Error("Failed to fetch live fee");
+    }
+    return response.json();
+}
+
+

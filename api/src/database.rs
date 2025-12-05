@@ -201,4 +201,85 @@ impl Database {
         let fee: Option<f64> = rows[0].get("recommended_fee");
         Ok(fee.unwrap_or(0.0) as i64)
     }
+
+    /// Get LIVE fee estimate for an account (P90 of last 10 slots + 20% buffer)
+    pub async fn get_live_fee_estimate(
+        &self,
+        pubkey: &str,
+    ) -> Result<LiveFeeEstimate> {
+        let client = self.pool.get().await?;
+        
+        // Get data from last 10 slots (~4 seconds)
+        let rows = client.query(
+            r#"
+            SELECT
+                slot,
+                COUNT(*) as tx_count,
+                AVG(lock_contention_score)::float8 as avg_contention,
+                MAX(priority_fee_lamports) as max_fee,
+                PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY priority_fee_lamports) as p90_fee
+            FROM write_lock_events
+            WHERE account_pubkey = $1
+              AND time >= NOW() - INTERVAL '30 seconds'
+              AND priority_fee_lamports IS NOT NULL
+            GROUP BY slot
+            ORDER BY slot DESC
+            LIMIT 10
+            "#,
+            &[&pubkey],
+        ).await?;
+
+        if rows.is_empty() {
+            return Ok(LiveFeeEstimate {
+                account: pubkey.to_string(),
+                queue_depth: 0,
+                p90_fee: 0,
+                recommended_fee: 0,
+                avg_contention: 0.0,
+                slots_observed: 0,
+            });
+        }
+
+        // Calculate aggregates
+        let queue_depth: i64 = rows.iter()
+            .map(|r| r.get::<_, i64>("tx_count"))
+            .sum();
+        
+        let avg_contention: f64 = rows.iter()
+            .map(|r| r.get::<_, Option<f64>>("avg_contention").unwrap_or(0.0))
+            .sum::<f64>() / rows.len() as f64;
+
+        // Get P90 across all recent slots
+        let mut all_fees: Vec<i64> = rows.iter()
+            .filter_map(|r| r.get::<_, Option<f64>>("p90_fee").map(|f| f as i64))
+            .collect();
+        all_fees.sort();
+        
+        let p90_idx = (all_fees.len() as f64 * 0.9).ceil() as usize;
+        let p90_fee = all_fees.get(p90_idx.saturating_sub(1)).copied().unwrap_or(0);
+        
+        // Recommended = P90 + 20% buffer
+        let recommended_fee = (p90_fee as f64 * 1.2) as i64;
+
+        Ok(LiveFeeEstimate {
+            account: pubkey.to_string(),
+            queue_depth: queue_depth as u32,
+            p90_fee,
+            recommended_fee,
+            avg_contention,
+            slots_observed: rows.len(),
+        })
+    }
 }
+
+/// Live fee estimate for real-time prediction
+#[derive(Debug, Clone)]
+pub struct LiveFeeEstimate {
+    pub account: String,
+    pub queue_depth: u32,
+    pub p90_fee: i64,
+    pub recommended_fee: i64,
+    pub avg_contention: f64,
+    pub slots_observed: usize,
+}
+

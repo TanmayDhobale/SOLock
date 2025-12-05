@@ -15,6 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod database;
 mod routes;
 mod websocket;
+mod known_programs;
 
 use database::Database;
 
@@ -45,6 +46,7 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(routes::dashboard_stats))
         .route("/api/hot-accounts", get(routes::hot_accounts))
         .route("/api/accounts/:pubkey/stats", get(routes::account_stats))
+        .route("/api/accounts/:pubkey/fee-now", get(routes::fee_now))
         .route("/api/priority-fees/estimate", post(routes::estimate_priority_fee))
         .route("/ws", get(websocket::ws_handler))
         .layer(CorsLayer::permissive())

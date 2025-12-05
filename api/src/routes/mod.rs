@@ -175,3 +175,39 @@ pub async fn estimate_priority_fee(
         recommended_fee_sol: fee as f64 / 1_000_000_000.0,
     }))
 }
+
+// GET /api/accounts/:pubkey/fee-now
+// Real-time fee estimate based on last 10 slots
+#[derive(Debug, Serialize)]
+pub struct LiveFeeResponse {
+    pub account: String,
+    pub queue_depth: u32,
+    pub p90_fee_lamports: i64,
+    pub recommended_fee_lamports: i64,
+    pub recommended_fee_sol: f64,
+    pub avg_contention: f64,
+    pub slots_observed: usize,
+    pub freshness_seconds: i64,
+}
+
+pub async fn fee_now(
+    Path(pubkey): Path<String>,
+    State(db): State<Database>,
+) -> Result<Json<LiveFeeResponse>, StatusCode> {
+    let estimate = db
+        .get_live_fee_estimate(&pubkey)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(LiveFeeResponse {
+        account: estimate.account,
+        queue_depth: estimate.queue_depth,
+        p90_fee_lamports: estimate.p90_fee,
+        recommended_fee_lamports: estimate.recommended_fee,
+        recommended_fee_sol: estimate.recommended_fee as f64 / 1_000_000_000.0,
+        avg_contention: estimate.avg_contention,
+        slots_observed: estimate.slots_observed,
+        freshness_seconds: 30, // Data from last 30 seconds
+    }))
+}
+

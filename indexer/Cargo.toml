@@ -39,3 +39,4 @@ chrono = { workspace = true }
 # Utilities
 bs58 = "0.5"
 futures = "0.3"
+once_cell = "1.19"

@@ -6,9 +6,12 @@ use solana_sdk::{
 };
 use solana_transaction_status::{UiTransactionEncoding, EncodedTransactionWithStatusMeta};
 use tracing::{info, warn};
+use std::sync::Arc;
+use std::collections::HashMap;
 
 use crate::database::{Database, WriteLockEvent};
 use crate::lock_detector::LockDetector;
+use crate::live_tracker::LiveTracker;
 
 pub struct RpcStream {
     rpc_endpoint: String,
@@ -31,10 +34,15 @@ impl RpcStream {
         )
     }
 
-    pub async fn process_slot(&mut self, database: &Database) -> Result<()> {
+    /// Process slot with live tracking for real-time fee estimation
+    pub async fn process_slot_live(
+        &mut self, 
+        database: &Database,
+        live_tracker: &Arc<LiveTracker>,
+    ) -> Result<()> {
         let endpoint = self.rpc_endpoint.clone();
         
-        // Get current slot (blocking call wrapped in spawn_blocking)
+        // Get current slot
         let current_slot = tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(endpoint, CommitmentConfig::confirmed());
             client.get_slot()
@@ -47,20 +55,14 @@ impl RpcStream {
 
         // Process slots we haven't seen yet
         if current_slot > self.last_processed_slot {
-            let slots_to_process = current_slot - self.last_processed_slot;
-            if slots_to_process > 10 {
-                info!("📦 Processing {} slots (from {} to {})", slots_to_process, self.last_processed_slot + 1, current_slot);
-            }
-            
             for slot in (self.last_processed_slot + 1)..=current_slot {
-                match self.process_single_slot(slot, database).await {
+                match self.process_single_slot_live(slot, database, live_tracker).await {
                     Ok(num_events) => {
                         if num_events > 0 {
-                            info!("✅ Slot {} processed: {} write lock events recorded", slot, num_events);
+                            info!("✅ Slot {} processed: {} events (live)", slot, num_events);
                         }
                     }
                     Err(e) => {
-                        // Only log some errors - skipped slots are normal
                         let err_str = e.to_string();
                         if !err_str.contains("was skipped") && !err_str.contains("SlotSkipped") {
                             warn!("⚠️ Error processing slot {}: {}", slot, e);
@@ -71,22 +73,27 @@ impl RpcStream {
             }
         }
 
-        // Small delay to avoid hammering the RPC
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Faster polling for real-time - 100ms instead of 200ms
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         Ok(())
     }
 
-    async fn process_single_slot(&self, slot: u64, database: &Database) -> Result<usize> {
+    async fn process_single_slot_live(
+        &self, 
+        slot: u64, 
+        database: &Database,
+        live_tracker: &Arc<LiveTracker>,
+    ) -> Result<usize> {
         let endpoint = self.rpc_endpoint.clone();
         
-        // Get block with transaction details (blocking call wrapped in spawn_blocking)
+        // Get block with transaction details
         let block = match tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(endpoint, CommitmentConfig::confirmed());
             client.get_block_with_config(
                 slot,
                 solana_client::rpc_config::RpcBlockConfig {
-                    encoding: Some(UiTransactionEncoding::Base64),  // Use Base64 for decode() compatibility
+                    encoding: Some(UiTransactionEncoding::Base64),
                     transaction_details: Some(
                         solana_transaction_status::TransactionDetails::Full,
                     ),
@@ -98,27 +105,22 @@ impl RpcStream {
         }).await? {
             Ok(block) => block,
             Err(_) => {
-                // Slot might not have a block (skipped slot), that's normal
                 return Ok(0);
             }
         };
 
         let mut detector = LockDetector::new();
         let mut events = Vec::new();
+        
+        // Track per-account stats for live tracker
+        let mut account_stats: HashMap<String, (u32, i64, i64)> = HashMap::new(); // (count, sum_fee, max_fee)
 
-        // Process transactions in the block
         if let Some(transactions) = block.transactions {
-            let tx_count = transactions.len();
-            if tx_count > 0 && slot % 50 == 0 {
-                info!("🔍 Slot {} has {} transactions", slot, tx_count);
-            }
-            
             for tx_with_meta in &transactions {
                 if let Some(transaction) = &tx_with_meta.transaction.decode() {
                     let signature = transaction.signatures[0].to_string();
                     let message = &transaction.message;
 
-                    // Track writable accounts
                     let writable_accounts: Vec<_> = message
                         .static_account_keys()
                         .iter()
@@ -131,23 +133,39 @@ impl RpcStream {
                         detector.track_transaction(&signature, &writable_accounts);
                     }
 
-                    // Extract priority fee and compute units from transaction
                     let priority_fee = extract_priority_fee(tx_with_meta);
                     let compute_units = extract_compute_units(tx_with_meta);
                     let success = tx_with_meta.meta.as_ref()
                         .and_then(|m| if m.status.is_ok() { Some(true) } else { None })
                         .unwrap_or(false);
 
-                    // Create events for each writable account
+                    // Extract program IDs from instructions
+                    let program_ids: Vec<String> = message.instructions().iter()
+                        .map(|ix| message.static_account_keys()[ix.program_id_index as usize].to_string())
+                        .collect();
+
                     for account in &writable_accounts {
                         let account_str = account.to_string();
                         let contention = detector.calculate_contention(&account_str);
+                        let fee = priority_fee.unwrap_or(0);
+
+                        // Update per-account stats
+                        let entry = account_stats.entry(account_str.clone()).or_insert((0, 0, 0));
+                        entry.0 += 1; // tx count
+                        entry.1 += fee; // sum fees
+                        entry.2 = entry.2.max(fee); // max fee
+
+                        // Find first non-system program ID (more interesting)
+                        let program_id = program_ids.iter()
+                            .find(|p| *p != "11111111111111111111111111111111" && 
+                                      *p != "ComputeBudget111111111111111111111111111111")
+                            .cloned();
 
                         let event = WriteLockEvent {
                             time: Utc::now(),
                             slot: slot as i64,
-                            account_pubkey: account_str.clone(),
-                            program_id: None,  // Could be extracted from instructions
+                            account_pubkey: account_str,
+                            program_id,
                             transaction_signature: signature.clone(),
                             success,
                             lock_contention_score: contention,
@@ -161,7 +179,142 @@ impl RpcStream {
             }
         }
 
+        // Update live tracker with per-account contention data
+        for (account, (tx_count, sum_fee, max_fee)) in account_stats {
+            let avg_fee = if tx_count > 0 { sum_fee / tx_count as i64 } else { 0 };
+            let contention = detector.calculate_contention(&account);
+            
+            live_tracker.record_slot(
+                &account,
+                slot,
+                contention,
+                tx_count,
+                avg_fee,
+                max_fee,
+            ).await;
+        }
+
         // Batch insert events
+        if !events.is_empty() {
+            info!("📝 Inserting {} events for slot {}", events.len(), slot);
+            database.insert_events(&events).await?;
+        }
+
+        Ok(events.len())
+    }
+
+    #[allow(dead_code)]
+    pub async fn process_slot(&mut self, database: &Database) -> Result<()> {
+        let endpoint = self.rpc_endpoint.clone();
+        
+        let current_slot = tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(endpoint, CommitmentConfig::confirmed());
+            client.get_slot()
+        }).await??;
+
+        if self.last_processed_slot == 0 {
+            self.last_processed_slot = current_slot.saturating_sub(5);
+            info!("🎯 Starting from slot {}", self.last_processed_slot);
+        }
+
+        if current_slot > self.last_processed_slot {
+            for slot in (self.last_processed_slot + 1)..=current_slot {
+                match self.process_single_slot(slot, database).await {
+                    Ok(num_events) => {
+                        if num_events > 0 {
+                            info!("✅ Slot {} processed: {} write lock events recorded", slot, num_events);
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("was skipped") && !err_str.contains("SlotSkipped") {
+                            warn!("⚠️ Error processing slot {}: {}", slot, e);
+                        }
+                    }
+                }
+                self.last_processed_slot = slot;
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn process_single_slot(&self, slot: u64, database: &Database) -> Result<usize> {
+        let endpoint = self.rpc_endpoint.clone();
+        
+        let block = match tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(endpoint, CommitmentConfig::confirmed());
+            client.get_block_with_config(
+                slot,
+                solana_client::rpc_config::RpcBlockConfig {
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    transaction_details: Some(
+                        solana_transaction_status::TransactionDetails::Full,
+                    ),
+                    rewards: Some(false),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                },
+            )
+        }).await? {
+            Ok(block) => block,
+            Err(_) => {
+                return Ok(0);
+            }
+        };
+
+        let mut detector = LockDetector::new();
+        let mut events = Vec::new();
+
+        if let Some(transactions) = block.transactions {
+            for tx_with_meta in &transactions {
+                if let Some(transaction) = &tx_with_meta.transaction.decode() {
+                    let signature = transaction.signatures[0].to_string();
+                    let message = &transaction.message;
+
+                    let writable_accounts: Vec<_> = message
+                        .static_account_keys()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| message.is_maybe_writable(*i))
+                        .map(|(_, key)| *key)
+                        .collect();
+
+                    if !writable_accounts.is_empty() {
+                        detector.track_transaction(&signature, &writable_accounts);
+                    }
+
+                    let priority_fee = extract_priority_fee(tx_with_meta);
+                    let compute_units = extract_compute_units(tx_with_meta);
+                    let success = tx_with_meta.meta.as_ref()
+                        .and_then(|m| if m.status.is_ok() { Some(true) } else { None })
+                        .unwrap_or(false);
+
+                    for account in &writable_accounts {
+                        let account_str = account.to_string();
+                        let contention = detector.calculate_contention(&account_str);
+
+                        let event = WriteLockEvent {
+                            time: Utc::now(),
+                            slot: slot as i64,
+                            account_pubkey: account_str,
+                            program_id: None,
+                            transaction_signature: signature.clone(),
+                            success,
+                            lock_contention_score: contention,
+                            priority_fee_lamports: priority_fee,
+                            compute_units_consumed: compute_units,
+                        };
+
+                        events.push(event);
+                    }
+                }
+            }
+        }
+
         if !events.is_empty() {
             info!("📝 Inserting {} events for slot {}", events.len(), slot);
             database.insert_events(&events).await?;
@@ -176,7 +329,7 @@ fn extract_priority_fee(tx: &EncodedTransactionWithStatusMeta) -> Option<i64> {
     tx.meta.as_ref().map(|m| m.fee as i64)
 }
 
-///Extract compute units from transaction metadata
+/// Extract compute units from transaction metadata
 fn extract_compute_units(tx: &EncodedTransactionWithStatusMeta) -> Option<i32> {
     use solana_transaction_status::option_serializer::OptionSerializer;
     tx.meta.as_ref().and_then(|m| match m.compute_units_consumed {
@@ -184,3 +337,4 @@ fn extract_compute_units(tx: &EncodedTransactionWithStatusMeta) -> Option<i32> {
         _ => None,
     })
 }
+
