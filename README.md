@@ -4,7 +4,10 @@ Real-time monitoring for Solana write lock contention.
 
 ## Demo
 
-https://github.com/TanmayDhobale/SOLock/raw/main/demo.mov
+
+https://github.com/user-attachments/assets/ac4175b9-7f3b-4d56-9db9-ab7489729112
+
+
 
 ## Overview
 
