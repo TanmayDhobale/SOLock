@@ -2,6 +2,10 @@
 
 Real-time monitoring for Solana write lock contention.
 
+## Demo
+
+https://github.com/TanmayDhobale/SOLock/raw/main/demo.mov
+
 ## Overview
 
 Tracks write lock contention on Solana mainnet, showing which accounts have the highest contention and what priority fees are being paid.
